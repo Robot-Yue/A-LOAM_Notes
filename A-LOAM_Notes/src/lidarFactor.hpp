@@ -18,11 +18,12 @@
  */
 struct LidarEdgeFactor
 {
-	LidarEdgeFactor(Eigen::Vector3d curr_point_, Eigen::Vector3d last_point_a_,
-					Eigen::Vector3d last_point_b_, double s_)
+	// 构造函数：以初始化列表方式初始化
+	LidarEdgeFactor(Eigen::Vector3d curr_point_, Eigen::Vector3d last_point_a_, Eigen::Vector3d last_point_b_, double s_)
 		: curr_point(curr_point_), last_point_a(last_point_a_), last_point_b(last_point_b_), s(s_) {}
 
 	template <typename T>
+	// ()运算符重载：仿函数，作用是计算残差
 	bool operator()(const T *q, const T *t, T *residual) const  // 构建残差函数，点到直线距离，跟论文中一样
 	{
 		// 残差计算过程
@@ -33,6 +34,7 @@ struct LidarEdgeFactor
 		Eigen::Matrix<T, 3, 1> lpb{T(last_point_b.x()), T(last_point_b.y()), T(last_point_b.z())};
 
 		// 获取当前帧相对于上一帧的旋转，并根据给点的畸变因子进行去畸变
+		// 构建当前帧到上一帧的旋转四元数和一个单位四元数
 		// Eigen::Quaternion<T> q_last_curr{q[3], T(s) * q[0], T(s) * q[1], T(s) * q[2]};
 		Eigen::Quaternion<T> q_last_curr{q[3], q[0], q[1], q[2]};
 		Eigen::Quaternion<T> q_identity{T(1), T(0), T(0), T(0)};
@@ -85,15 +87,13 @@ struct LidarEdgeFactor
  */
 struct LidarPlaneFactor
 {
-	LidarPlaneFactor(Eigen::Vector3d curr_point_, Eigen::Vector3d last_point_j_,
-					 Eigen::Vector3d last_point_l_, Eigen::Vector3d last_point_m_, double s_)
-		: curr_point(curr_point_), last_point_j(last_point_j_), last_point_l(last_point_l_),
-		  last_point_m(last_point_m_), s(s_)
+	LidarPlaneFactor(Eigen::Vector3d curr_point_, Eigen::Vector3d last_point_j_, Eigen::Vector3d last_point_l_, Eigen::Vector3d last_point_m_, double s_)
+		: curr_point(curr_point_), last_point_j(last_point_j_), last_point_l(last_point_l_), last_point_m(last_point_m_), s(s_)
 	{
 		// 求出平面单位法向量
 		// 点l、j、m就是搜索到的最近邻的3个点，下面就是计算出这三个点构成的平面ljlm的法向量
 		ljm_norm = (last_point_j - last_point_l).cross(last_point_j - last_point_m);
-		ljm_norm.normalize();  // 对应的点到平面的距离只需要向这个归一化向量上投影就行了
+		ljm_norm.normalize();  // 法向量单位化
 	}
 
 	template <typename T>
@@ -106,19 +106,19 @@ struct LidarPlaneFactor
 		//Eigen::Matrix<T, 3, 1> lpm{T(last_point_m.x()), T(last_point_m.y()), T(last_point_m.z())};
 		Eigen::Matrix<T, 3, 1> ljm{T(ljm_norm.x()), T(ljm_norm.y()), T(ljm_norm.z())};
 
-		// 对点进行去畸变
-		//Eigen::Quaternion<T> q_last_curr{q[3], T(s) * q[0], T(s) * q[1], T(s) * q[2]};
-		Eigen::Quaternion<T> q_last_curr{q[3], q[0], q[1], q[2]};
-		Eigen::Quaternion<T> q_identity{T(1), T(0), T(0), T(0)};
-		// 根据时间戳进行插值
+		// Eigen::Quaternion<T> q_last_curr{q[3], T(s) * q[0], T(s) * q[1], T(s) * q[2]};
+		Eigen::Quaternion<T> q_last_curr{q[3], q[0], q[1], q[2]}; // 当前帧到上一帧的旋转四元数
+		Eigen::Quaternion<T> q_identity{T(1), T(0), T(0), T(0)}; // 单位四元数
+
 		q_last_curr = q_identity.slerp(T(s), q_last_curr);
 		Eigen::Matrix<T, 3, 1> t_last_curr{T(s) * t[0], T(s) * t[1], T(s) * t[2]};
 
 		Eigen::Matrix<T, 3, 1> lp;
-		lp = q_last_curr * cp + t_last_curr;  // 得到了相对于这一帧起始坐标的点云位置（去畸变的点云坐标）
+		lp = q_last_curr * cp + t_last_curr; // 当前点转到上一帧
 		
 		// 计算 p 到 ljm 平面的距离
 		// d = pj 点乘 ljm 平面的单位法向量
+		// 点 lp 和点 lpj 构成的向量在法向量的投影，就是 lp 到平面的距离
 		residual[0] = (lp - lpj).dot(ljm);
 
 		return true;
@@ -129,15 +129,13 @@ struct LidarPlaneFactor
 									   const Eigen::Vector3d last_point_l_, const Eigen::Vector3d last_point_m_,
 									   const double s_)
 	{
-		return (new ceres::AutoDiffCostFunction<
-				LidarPlaneFactor, 1, 4, 3>(
-			new LidarPlaneFactor(curr_point_, last_point_j_, last_point_l_, last_point_m_, s_)));
+		return (new ceres::AutoDiffCostFunction<LidarPlaneFactor, 1, 4, 3>(new LidarPlaneFactor(curr_point_, last_point_j_, last_point_l_, last_point_m_, s_)));
 	}
 
 	// 观测量为当前帧的点 p，上一帧中构成平面特征的三个点 j, l, m，以及 jlm 平面形成的法向量
 	Eigen::Vector3d curr_point, last_point_j, last_point_l, last_point_m;
 	Eigen::Vector3d ljm_norm;
-	double s;  // 畸变因子，0 表示起始点（对应上一帧结束时间点），1表示结束点（对应当前帧结束时间点）
+	double s;  // 畸变因子，0 表示起始点（对应上一帧结束时间点），1 表示结束点（对应当前帧结束时间点）
 };
 
 
@@ -149,9 +147,8 @@ struct LidarPlaneFactor
 struct LidarPlaneNormFactor
 {
 
-	LidarPlaneNormFactor(Eigen::Vector3d curr_point_, Eigen::Vector3d plane_unit_norm_,
-						 double negative_OA_dot_norm_) : curr_point(curr_point_), plane_unit_norm(plane_unit_norm_),
-														 negative_OA_dot_norm(negative_OA_dot_norm_) {}
+	LidarPlaneNormFactor(Eigen::Vector3d curr_point_, Eigen::Vector3d plane_unit_norm_, double negative_OA_dot_norm_) 
+	                    : curr_point(curr_point_), plane_unit_norm(plane_unit_norm_), negative_OA_dot_norm(negative_OA_dot_norm_) {}
 
 	template <typename T>
 	bool operator()(const T *q, const T *t, T *residual) const
@@ -174,9 +171,7 @@ struct LidarPlaneNormFactor
 	static ceres::CostFunction *Create(const Eigen::Vector3d curr_point_, const Eigen::Vector3d plane_unit_norm_,
 									   const double negative_OA_dot_norm_)
 	{
-		return (new ceres::AutoDiffCostFunction<
-				LidarPlaneNormFactor, 1, 4, 3>(
-			new LidarPlaneNormFactor(curr_point_, plane_unit_norm_, negative_OA_dot_norm_)));
+		return (new ceres::AutoDiffCostFunction<LidarPlaneNormFactor, 1, 4, 3>(new LidarPlaneNormFactor(curr_point_, plane_unit_norm_, negative_OA_dot_norm_)));
 	}
 
 	Eigen::Vector3d curr_point;
