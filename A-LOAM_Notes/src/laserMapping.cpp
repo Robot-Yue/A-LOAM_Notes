@@ -1,6 +1,8 @@
 /*
 	通过已经获得的激光里程计信息来消除激光里程计和地图之间的误差（也就是累计的误差），使得最终的姿态都是关于世界坐标的。
 	进行帧与submap的点云特征配准，对Odometry线程计算的位姿进行微调
+	订阅了来自laserOdometry的四个话题：地图点点云、上一帧的边线点集合，上一帧的平面点集合，当前帧的位姿粗估计。
+	发布了四个话题：附近帧组成的点云集合（submap），所有帧组成的点云地图，当前帧的位姿精估计。
 	https://zhuanlan.zhihu.com/p/400014744
 */
 
@@ -22,15 +24,15 @@
 #include <tf/transform_broadcaster.h>
 #include <eigen3/Eigen/Dense>
 #include <ceres/ceres.h>
-#include <mutex>  //互斥锁头文件
+#include <mutex>  // 互斥锁头文件
 #include <queue>
 #include <thread>
 #include <iostream>
 #include <string>
 
 #include "lidarFactor.hpp"
-#include "aloam_velodyne/common.h"   //关于弧度和角度相互转换
-#include "aloam_velodyne/tic_toc.h"  //计算时间间隔
+#include "aloam_velodyne/common.h"   // 关于弧度和角度相互转换
+#include "aloam_velodyne/tic_toc.h"  // 计算时间间隔
 
 
 int frameCount = 0;
@@ -93,7 +95,6 @@ double parameters[7] = {0, 0, 0, 1, 0, 0, 0};
 Eigen::Map<Eigen::Quaterniond> q_w_curr(parameters);
 Eigen::Map<Eigen::Vector3d> t_w_curr(parameters + 4);
 
-// wmap_T_odom * odom_T_curr = wmap_T_curr;
 // transformation between odom's world and map's world frame
 // 下面的两个变量是world坐标系下的Odometry计算的位姿和Mapping计算的位姿之间的增量（也即变换，transformation）
 Eigen::Quaterniond q_wmap_wodom(1, 0, 0, 0);
@@ -118,15 +119,13 @@ std::vector<int> pointSearchInd;
 std::vector<float> pointSearchSqDis;
 
 PointType pointOri, pointSel;
-
 ros::Publisher pubLaserCloudSurround, pubLaserCloudMap, pubLaserCloudFullRes, pubOdomAftMapped, pubOdomAftMappedHighFrec, pubLaserAfterMappedPath;
-
 nav_msgs::Path laserAfterMappedPath;
 
 // set initial guess
 // 根据里程计的估计的位姿，和当前后端估计的位姿偏差，计算出全局坐标下的位姿
 /*
- *  上一帧的增量wmap_wodom * 本帧Odometry位姿wodom_curr，旨在为本帧Mapping位姿w_curr设置一个初始值
+ *  上一帧的增量 wmap_wodom * 激光里程计下当前位姿 wodom_curr，旨在为世界坐标系下当前位姿 w_curr 设置一个初始值
  */
 // 里程计位姿转化为地图位姿，作为后端初始估计
 void transformAssociateToMap()
@@ -216,7 +215,7 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &laserOdometry)
 	mBuf.unlock(); // 解锁 (如果没有数据了，则线程解锁)
 
 	// high frequence publish
-		// 获取里程计位姿
+	// 获取里程计位姿
 	Eigen::Quaterniond q_wodom_curr;
 	Eigen::Vector3d t_wodom_curr;
 	q_wodom_curr.x() = laserOdometry->pose.pose.orientation.x;
@@ -252,24 +251,23 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &laserOdometry)
 // 主处理线程：进行Mapping，即帧与submap的匹配，对Odometry计算的位姿进行微调
 void process()
 {
-	while(1)
+	while(1)  // while(1) 表示无限循环，除非设置break等类似的跳出循环语句循环才会中止
 	{
 		// 四个队列分别存放边线点、平面点、全部点、和里程计位姿，要确保需要的buffer里都有值
 		// laserOdometry模块对本节点的执行频率进行了控制，laserOdometry模块publish的位姿是10Hz，点云的publish频率没这么高，限制是2hz
-		while (!cornerLastBuf.empty() && !surfLastBuf.empty() &&
-			!fullResBuf.empty() && !odometryBuf.empty())
+		while (!cornerLastBuf.empty() && !surfLastBuf.empty() && !fullResBuf.empty() && !odometryBuf.empty())
 		{
 			// 为了保证LOAM算法整体的实时性，Mapping线程每次只处理cornerLastBuf.front()及其他与之时间同步的消息
-			mBuf.lock();  //线程加锁，避免线程冲突
+			mBuf.lock();  // 线程加锁，避免线程冲突
  
 			// 以cornerLastBuf为基准，把时间戳小于它的全部pop出去，保证其他容器的最新消息与cornerLastBuf.front()最新消息时间戳同步
 			// odometryBuf只保留一个与cornerLastBuf.front()时间同步的最新消息
 			while (!odometryBuf.empty() && odometryBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
-				odometryBuf.pop();
+				odometryBuf.pop(); // 最前面的数据时间戳小于基准时间则pop
 			// 如果筛除完后 Buffer 为空，说明没有一组时间匹配的数据，因此退出这一次处理等待新消息
 			if (odometryBuf.empty())
 			{
-				mBuf.unlock();  //如果没有数据了，则线程解锁
+				mBuf.unlock();  // 如果没有数据了，则线程解锁，可以继续存数据
 				break;
 			}
 			
@@ -291,6 +289,7 @@ void process()
 				break;
 			}
 
+			// 取出处理后的数据的 最前面一个数据的 时间戳 
 			timeLaserCloudCornerLast = cornerLastBuf.front()->header.stamp.toSec();
 			timeLaserCloudSurfLast = surfLastBuf.front()->header.stamp.toSec();
 			timeLaserCloudFullRes = fullResBuf.front()->header.stamp.toSec();
@@ -298,9 +297,7 @@ void process()
 			
 			// 确认收到的角点、平面、全点云以及里程计数据时间戳是否一致，由于前端每次会同时发布这四个数据，所以理论上应该可以得到四个时间戳相同的数据
 			// 原则上取出来的时间戳都是一样的，如果不一样则说明有问题
-			if (timeLaserCloudCornerLast != timeLaserOdometry ||
-				timeLaserCloudSurfLast != timeLaserOdometry ||
-				timeLaserCloudFullRes != timeLaserOdometry)
+			if (timeLaserCloudCornerLast != timeLaserOdometry || timeLaserCloudSurfLast != timeLaserOdometry || timeLaserCloudFullRes != timeLaserOdometry)
 			{
 				printf("time corner %f surf %f full %f odom %f \n", timeLaserCloudCornerLast, timeLaserCloudSurfLast, timeLaserCloudFullRes, timeLaserOdometry);
 				printf("unsync messeage!");
@@ -309,9 +306,10 @@ void process()
 			}
 
 			// 取出下一帧要处理的角点、平面以及全部 ROS 点云消息，转换为 PCL 格式
-			laserCloudCornerLast->clear();
+			// 把队列顶部取得的消息转化为pcl点云，用智能指针定位
+			laserCloudCornerLast->clear(); // 清空上次操作的上帧点云中的点
 			pcl::fromROSMsg(*cornerLastBuf.front(), *laserCloudCornerLast);
-			cornerLastBuf.pop();
+			cornerLastBuf.pop(); // pop掉buf中的本次处理的数据
 
 			laserCloudSurfLast->clear();
 			pcl::fromROSMsg(*surfLastBuf.front(), *laserCloudSurfLast);
@@ -321,7 +319,7 @@ void process()
 			pcl::fromROSMsg(*fullResBuf.front(), *laserCloudFullRes);
 			fullResBuf.pop();
 
-			// 取出上述消息对应的前端计算的当前位姿，存到对应的 q 和 t 中
+			// 取出当前帧在odom坐标系下的位姿，存到对应的 q 和 t 中
 			// 记录odometry前端线程传过来的位姿
 			q_wodom_curr.x() = odometryBuf.front()->pose.pose.orientation.x;
 			q_wodom_curr.y() = odometryBuf.front()->pose.pose.orientation.y;
@@ -333,20 +331,19 @@ void process()
 			odometryBuf.pop();
 
 			// 清空 cornerLastBuf 的历史缓存，为了LOAM 的整体实时性
-			// 考虑到实时性，Mapping线程耗时>100ms导致的队列里缓存的其他边线点都pop出去，不然可能出现处理延时的情况
+			// 考虑到实时性，Mapping线程耗时 >100ms 导致的队列里缓存的其他边线点都pop出去，不然可能出现处理延时的情况
 			while(!cornerLastBuf.empty())
 			{
-				cornerLastBuf.pop();
+				cornerLastBuf.pop(); // 考虑到实时性，就把队列里其它的都pop出去，不然可能出现延时的情况
 				printf("drop lidar frame in mapping for real time performance \n");
 			}
 
 			mBuf.unlock();
 
-			TicToc t_whole;  //计算这个线程的全部时间
+			TicToc t_whole;  // 计算这个线程的全部时间
 			// 根据前端结果，将里程计位姿转化为地图位姿得到后端优化的一个初始估计值
 			transformAssociateToMap();
-
-			TicToc t_shift; //计算位姿转换的时间
+			TicToc t_shift; // 计算位姿转换的时间
 			
 			// 后端地图本质上是一个以当前点为中心的一个珊格地图，根据初始估计值计算寻找当前位姿在地图中的索引，一个格子的边长是50m
 			
@@ -356,8 +353,9 @@ void process()
 			// 的偏移，来使得当前位置尽量位于submap的中心处，也就是使得上图中的五角星位置尽量处于所有格子的中心附近，
 			// 偏移laserCloudCenWidth/Heigh/Depth会动态调整，来保证当前位置尽量位于submap的中心处。
 
-			// 计算当前位姿在全局三维栅格中存放的位置（索引），栅格分辨率为 50 
+			// 计算当前位姿在全局三维栅格中存放的位置（索引），栅格分辨率为 50 ，因为栅格是21*21*11，所以初始是10,10,5
 			// + 25.0 起四舍五入的作用，([0, 25) 取 0, [25, 50} 进 1)
+			// 寻找当前位姿对应的哪一个cube（地图已经被切分为很多cube）
 			int centerCubeI = int((t_w_curr.x() + 25.0) / 50.0) + laserCloudCenWidth;  
 			int centerCubeJ = int((t_w_curr.y() + 25.0) / 50.0) + laserCloudCenHeight;
 			int centerCubeK = int((t_w_curr.z() + 25.0) / 50.0) + laserCloudCenDepth;
@@ -372,14 +370,15 @@ void process()
 			if (t_w_curr.z() + 25.0 < 0)
 				centerCubeK--;
 
-			// 如果当前珊格索引小于3,就说明当前点快接近地图边界了，需要进行调整，相当于地图整体往x正方向移动
+			// 如果当前珊格索引小于3，就说明当前点快接近地图边界了，需要进行调整，相当于地图整体往x正方向移动
 
 			// 当点云中心栅格坐标靠近栅格宽度负方向边缘时，需要将所有点云向宽度正方向移一个栅格，以腾出空间，保证栅格能够在宽度负方向容纳更多点云
 			// 这里用 3 个栅格长度（150m）作为缓冲区域，即保证当前位姿周围 150 m 范围内的激光点都可以进行存放
 
 			// 调整取值范围:3 < centerCubeI < 18， 3 < centerCubeJ < 18, 3 < centerCubeK < 8
 			// 目的是为了防止后续向四周拓展cube（图中的黄色cube就是拓展的cube）时，index（即IJK坐标）成为负数
-			// 如果处于下边界，表明地图向负方向延伸的可能性比较大，则循环移位，将数组中心点向上边界调整一个单位
+			// 下面是动态调整栅格地图的部分，即处理快要出边界的情况，对栅格地图做动态调整
+			// 首先是当x轴当前帧栅格索引小于3，说明快出边界了，让整体向x方向移动
 			while (centerCubeI < 3)
 			{
 				for (int j = 0; j < laserCloudHeight; j++)
@@ -388,36 +387,42 @@ void process()
 					{ 
 						// 宽度方向上的边界（最后一个点云） 
 						int i = laserCloudWidth - 1;
+						// 从x最大值开始，然后取出了最右边的一片点云
 						pcl::PointCloud<PointType>::Ptr laserCloudCubeCornerPointer =
 							laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k]; 
 						pcl::PointCloud<PointType>::Ptr laserCloudCubeSurfPointer =
 							laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
 						
-						// 不改变点云在高度和深度的栅格坐标，对其在宽度方向向往正方向移动一个单位，正方向边缘的点云会被移除
+						// 宽度方向上整体右移
 						for (; i >= 1; i--)// 在I方向上，将cube[I] = cube[I-1],最后一个空出来的cube清空点云，实现IJK坐标系向I轴负方向移动一个cube的
 										   // 效果，从相对运动的角度看，就是图中的五角星在IJK坐标系下向I轴正方向移动了一个cube，如下面的动图所示，所
 				                           // 以centerCubeI最后++，laserCloudCenWidth也会++，为下一帧Mapping时计算五角星的IJK坐标做准备。
 						{
+							// 移动地图角点
 							laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 								laserCloudCornerArray[i - 1 + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
+							// 移动地图面点
 							laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 								laserCloudSurfArray[i - 1 + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
 						}
+						// 此时i = 0,也就是最左边的格子赋值给了之前最右边的格子
 						laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 							laserCloudCubeCornerPointer;
 						laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 							laserCloudCubeSurfPointer;
+						// 该点云清零，由于是指针操作，相当于最左边的格子清空了
 						laserCloudCubeCornerPointer->clear();
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
+				// 索引右移
 				centerCubeI++;
 				// 在移动完点云后，需要将原点对应的栅格坐标也向宽度正方向移动一个单位，保证栅格坐标计算的正确性
 				laserCloudCenWidth++;
 			}
 
 			// 当点云中心栅格坐标靠近栅格宽度正方向边缘时，需要将所有点云向宽度负方向移一个栅格，进行和上面一样的操作
+			// 然后是当前帧位置接近右边的边界，和上面的类似，相当于整体左移
 			while (centerCubeI >= laserCloudWidth - 3)
 			{ 
 				for (int j = 0; j < laserCloudHeight; j++)
@@ -445,7 +450,6 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeI--;
 				laserCloudCenWidth--;
 			}
@@ -477,11 +481,10 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeJ++;
 				laserCloudCenHeight++;
 			}
-			// 对栅格高度方向进行一样的操作
+
 			while (centerCubeJ >= laserCloudHeight - 3)
 			{
 				for (int i = 0; i < laserCloudWidth; i++)
@@ -508,7 +511,6 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeJ--;
 				laserCloudCenHeight--;
 			}
@@ -540,11 +542,10 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeK++;
 				laserCloudCenDepth++;
 			}
-			// 对栅格深度方向进行一样的操作
+
 			while (centerCubeK >= laserCloudDepth - 3)
 			{
 				for (int i = 0; i < laserCloudWidth; i++)
@@ -571,11 +572,11 @@ void process()
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
-
 				centerCubeK--;
 				laserCloudCenDepth--;
 			}
 
+			// 上面随着当前帧位置调整完栅格地图后,下面则根据当前位置取出该位置附近的地图
 			int laserCloudValidNum = 0;
 			int laserCloudSurroundNum = 0;
 
@@ -602,9 +603,11 @@ void process()
 			}
 
 			// 提取局部地图点云（当前载体附近的点云）
+			// 清空上一次从地图出取出的 角点地图和面点地图
 			laserCloudCornerFromMap->clear();
 			laserCloudSurfFromMap->clear();
 			
+			// 构建用来优化当前帧的局部地图
 			for (int i = 0; i < laserCloudValidNum; i++)
 			{
 				// 将有效index的cube中的点云叠加到一起组成submap的特征点云
@@ -613,7 +616,6 @@ void process()
 			}
 			int laserCloudCornerFromMapNum = laserCloudCornerFromMap->points.size();
 			int laserCloudSurfFromMapNum = laserCloudSurfFromMap->points.size();
-
 			
 			// 对待处理的角点点云进行降采样处理
 			pcl::PointCloud<PointType>::Ptr laserCloudCornerStack(new pcl::PointCloud<PointType>());
@@ -1050,15 +1052,14 @@ int main(int argc, char **argv)
 	ros::NodeHandle nh;
 
 	// 获取参数：线和平面的分辨率
-	float lineRes = 0;  // 次极大边线点集体素滤波分辨率
-	float planeRes = 0;  // 次极小平面点集体素滤波分辨率
+	float lineRes = 0;  // 次极大边线点集 体素滤波分辨率
+	float planeRes = 0;  // 次极小平面点集 体素滤波分辨率
 	// 对地图特征点云下采样的分辨率
 	nh.param<float>("mapping_line_resolution", lineRes, 0.4); 
 	nh.param<float>("mapping_plane_resolution", planeRes, 0.8);
 	printf("line resolution %f plane resolution %f \n", lineRes, planeRes);
-
 	// 根据给定的线和平面的分辨率对角点和平面的降采样滤波最小尺寸进行设置
-	downSizeFilterCorner.setLeafSize(lineRes, lineRes,lineRes);
+	downSizeFilterCorner.setLeafSize(lineRes, lineRes, lineRes);
 	downSizeFilterSurf.setLeafSize(planeRes, planeRes, planeRes);
 
 	// 初始化 subcriber，订阅角点和平面的点云消息、前端里程计的估计结果以及全部点云
@@ -1087,6 +1088,5 @@ int main(int argc, char **argv)
 	std::thread mapping_process{process};
 
 	ros::spin();
-
 	return 0;
 }
